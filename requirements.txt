@@ -1,0 +1,8 @@
+torch==2.2.2
+numpy==1.26.4
+transformers==5.0.0
+tiktoken==0.13.0
+pandas==3.0.5
+openai==2.53.0
+httpx==0.28.1
+pydantic==2.13.4
