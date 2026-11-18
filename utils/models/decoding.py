@@ -1,6 +1,22 @@
-"""Управление кандидатами после логитов: top-k, top-p и repetition penalty."""
+"""Управление кандидатами после логитов: top-k, top-p и штрафы за повтор.
+
+Обычный порядок вызовов совпадает с шагами генерации:
+
+исходные логиты
+    → apply_repetition_penalty или apply_frequency_penalty
+    → apply_temperature
+    → apply_top_k, затем apply_top_p
+    → choose_greedy_token или sample_tokens
+
+Температура меняет форму распределения и не выбрасывает токены.
+top-k и top-p уже режут множество кандидатов: исключённым логитам
+ставится ``-inf``. Штрафы смотрят на историю и только уменьшают оценки
+уже встреченных токенов.
+"""
 
 from __future__ import annotations
+
+import math
 
 import torch
 import pandas as pd
@@ -130,6 +146,240 @@ def apply_repetition_penalty(
     return processed_logits
 
 
+def apply_temperature(
+    logits: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Делит логиты на температуру и возвращает новый тензор.
+
+    Температуру применяют до top-k и top-p. Она не меняет порядок
+    положительных логитов: самый большой остаётся самым большим.
+    Значение меньше 1 делает распределение острее, больше 1 — ровнее.
+    Поэтому один и тот же top-p при низкой температуре оставляет мало
+    кандидатов, а при высокой — много.
+
+    Args:
+        logits: Логиты токенов, тензор формы ``[vocab_size]``.
+        temperature: Положительная температура. ``1.0`` оставляет логиты
+            как есть.
+
+    Returns:
+        Новые логиты. Исходный тензор не изменяется.
+    """
+    if logits.ndim != 1:
+        raise ValueError("logits must be a one-dimensional tensor")
+
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("temperature must be finite and greater than 0")
+
+    return logits / temperature
+
+
+def apply_frequency_penalty(
+    logits: torch.Tensor,
+    token_counts: dict[int, int],
+    alpha: float,
+) -> torch.Tensor:
+    """Снижает логит пропорционально числу предыдущих появлений токена.
+
+    Форма из урока: ``z' = z - alpha * count``. Первый повтор получает
+    штраф ``alpha``, пятый — ``5 * alpha``. ``repetition_penalty`` так
+    не делает: ему важен только факт появления, и штраф каждый раз один.
+
+    Точная формула в чужом API может отличаться. Здесь реализован
+    вариант, которым урок объясняет разницу двух штрафов.
+
+    Args:
+        logits: Логиты токенов, тензор формы ``[vocab_size]``.
+        token_counts: Сколько раз каждый id уже встречался.
+        alpha: Сила частотного штрафа. ``0`` ничего не меняет.
+
+    Returns:
+        Копия логитов после штрафа.
+    """
+    if logits.ndim != 1:
+        raise ValueError("logits must be a one-dimensional tensor")
+
+    if not math.isfinite(alpha) or alpha < 0:
+        raise ValueError("alpha must be finite and greater than or equal to 0")
+
+    vocab_size = logits.numel()
+    invalid_token_ids = sorted(
+        token_id
+        for token_id in token_counts
+        if not 0 <= token_id < vocab_size
+    )
+    if invalid_token_ids:
+        raise ValueError(f"Unknown token IDs: {invalid_token_ids}")
+
+    negative_counts = sorted(
+        token_id for token_id, count in token_counts.items() if count < 0
+    )
+    if negative_counts:
+        raise ValueError(
+            f"token counts must be non-negative, got ids {negative_counts}"
+        )
+
+    processed_logits = logits.clone()
+    if alpha == 0:
+        return processed_logits
+
+    for token_id, count in token_counts.items():
+        if count == 0:
+            continue
+        processed_logits[token_id] = processed_logits[token_id] - alpha * count
+
+    return processed_logits
+
+
+def logits_from_probabilities(
+    probabilities: list[float] | torch.Tensor,
+) -> torch.Tensor:
+    """Переводит готовую таблицу вероятностей в логиты.
+
+    Учебные распределения урока заданы вероятностями, а фильтры работают
+    с логитами. ``softmax(log(p))`` возвращает исходные ``p``, если они
+    положительны и в сумме дают 1.
+
+    Args:
+        probabilities: Вероятности токенов в исходном порядке.
+
+    Returns:
+        Логиты той же длины.
+    """
+    probs = torch.as_tensor(probabilities, dtype=torch.float32)
+    if probs.ndim != 1 or probs.numel() == 0:
+        raise ValueError("probabilities must be a non-empty one-dimensional tensor")
+
+    if not torch.isfinite(probs).all() or torch.any(probs <= 0):
+        raise ValueError("probabilities must be finite and positive")
+
+    if not torch.isclose(probs.sum(), torch.tensor(1.0), atol=1e-4):
+        raise ValueError("probabilities must sum to 1")
+
+    return torch.log(probs)
+
+
+def describe_logits(
+    logits: torch.Tensor,
+    tokens: list[str],
+) -> list[dict[str, object]]:
+    """Описывает текущие логиты: оценка, вероятность и признак «токен оставлен».
+
+    Вероятность считается softmax-ом по конечным логитам. После top-k или
+    top-p это уже нормализованное распределение среди оставшихся кандидатов:
+    у исключённых токенов вероятность 0, у оставшихся сумма равна 1.
+
+    Args:
+        logits: Логиты токенов, тензор формы ``[vocab_size]``.
+        tokens: Имена токенов в том же порядке, что и логиты.
+
+    Returns:
+        Список словарей с ключами ``token``, ``logit``, ``probability``,
+        ``kept``.
+    """
+    if logits.ndim != 1:
+        raise ValueError("logits must be a one-dimensional tensor")
+
+    if len(tokens) != logits.numel():
+        raise ValueError("tokens and logits must have the same length")
+
+    kept = torch.isfinite(logits)
+    if not bool(kept.any()):
+        raise ValueError("at least one logit must be finite")
+
+    probabilities = torch.softmax(logits, dim=-1)
+    rows: list[dict[str, object]] = []
+    for index, token in enumerate(tokens):
+        is_kept = bool(kept[index].item())
+        rows.append(
+            {
+                "token": token,
+                "logit": float(logits[index].item()) if is_kept else float("-inf"),
+                "probability": float(probabilities[index].item()),
+                "kept": is_kept,
+            }
+        )
+    return rows
+
+
+def kept_probability_mass(
+    original_logits: torch.Tensor,
+    processed_logits: torch.Tensor,
+) -> float:
+    """Суммирует исходные вероятности токенов, прошедших фильтр.
+
+    Это масса до повторной нормализации. У top-p она не меньше порога:
+    в набор входит и тот токен, на котором накопленная вероятность
+    впервые его пересекла.
+
+    Args:
+        original_logits: Логиты до фильтрации.
+        processed_logits: Логиты после фильтра. Исключённые равны ``-inf``.
+
+    Returns:
+        Доля исходного распределения, которая осталась в кандидатах.
+    """
+    if original_logits.shape != processed_logits.shape:
+        raise ValueError("logits must have the same shape")
+
+    original_probs = torch.softmax(original_logits, dim=-1)
+    kept = torch.isfinite(processed_logits)
+    return float(original_probs[kept].sum().item())
+
+
+def kept_token_ids(logits: torch.Tensor) -> list[int]:
+    """Возвращает id токенов с конечным логитом, от большего логита к меньшему."""
+    if logits.ndim != 1:
+        raise ValueError("logits must be a one-dimensional tensor")
+
+    finite_ids = torch.nonzero(torch.isfinite(logits), as_tuple=False).flatten()
+    if finite_ids.numel() == 0:
+        return []
+
+    order = torch.argsort(logits[finite_ids], descending=True)
+    return [int(token_id) for token_id in finite_ids[order]]
+
+
+def kept_names(logits: torch.Tensor, tokens: list[str]) -> list[str]:
+    """Возвращает имена оставшихся токенов от большего логита к меньшему."""
+    if len(tokens) != logits.numel():
+        raise ValueError("tokens and logits must have the same length")
+
+    return [tokens[token_id] for token_id in kept_token_ids(logits)]
+
+
+def probability_rows(
+    tokens: list[str],
+    original_logits: torch.Tensor,
+    processed_logits: torch.Tensor,
+) -> list[dict[str, object]]:
+    """Собирает вероятность до фильтра и после нормализации оставшихся.
+
+    Args:
+        tokens: Имена токенов в том же порядке, что и логиты.
+        original_logits: Логиты до фильтрации.
+        processed_logits: Логиты после фильтра. Исключённые равны ``-inf``.
+
+    Returns:
+        Строки с ключами ``token``, ``probability_before``,
+        ``probability_after`` и ``kept``.
+    """
+    before = describe_logits(original_logits, tokens)
+    after = describe_logits(processed_logits, tokens)
+    rows: list[dict[str, object]] = []
+    for left, right in zip(before, after):
+        rows.append(
+            {
+                "token": left["token"],
+                "probability_before": left["probability"],
+                "probability_after": right["probability"],
+                "kept": right["kept"],
+            }
+        )
+    return rows
+
+
 def choose_greedy_token(logits: torch.Tensor) -> int:
     """Возвращает идентификатор токена с максимальным логитом."""
     return int(torch.argmax(logits).item())
@@ -251,10 +501,7 @@ def diagnose_decoding_controls(
     case_2_logits = torch.tensor(
         [1.0, 0.8, 0.5, 0.4, 0.3, 5.0, 4.8, 4.5, 4.2, -1.0]
     )
-    # Seed из урока ([11, 22, 33, 44, 55]) на torch 2.2.2 дают только
-    # два уникальных токена даже при top_k=5 из‑за другого RNG.
-    # Эти seed сохраняют педагогический итог урока: 1 → 2 → ≥3 уникальных.
-    case_2_seeds = [0, 2, 4, 6, 8]
+    case_2_seeds = [11, 22, 33, 44, 55]
     case_2_rows = []
     for top_k in [1, 2, 3, 5]:
         processed = apply_top_k(case_2_logits, top_k=top_k)
@@ -278,7 +525,6 @@ def diagnose_decoding_controls(
             [0.28, 0.21, 0.16, 0.11, 0.08, 0.06, 0.04, 0.03, 0.02, 0.01]
         )
     )
-    original_probs = torch.softmax(case_3_logits, dim=-1)
     case_3_rows = []
     for top_p in [1.0, 0.95, 0.9, 0.8]:
         processed = apply_top_p(case_3_logits, top_p=top_p)
@@ -287,8 +533,8 @@ def diagnose_decoding_controls(
             {
                 "top_p": top_p,
                 "available_count": int(available_mask.sum().item()),
-                "kept_probability_mass": float(
-                    original_probs[available_mask].sum().item()
+                "kept_probability_mass": kept_probability_mass(
+                    case_3_logits, processed
                 ),
                 "problem_token_available": bool(available_mask[9].item()),
             }
